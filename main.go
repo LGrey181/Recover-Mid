@@ -2,11 +2,21 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"runtime/debug"
+	"strconv"
+	"strings"
+
+	"github.com/alecthomas/chroma/v2/formatters/html"
+	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/alecthomas/chroma/v2/styles"
 )
 
 func main() {
@@ -14,7 +24,42 @@ func main() {
 	mux.HandleFunc("/panic/", panicDemo)
 	mux.HandleFunc("/panic-after/", panicAfterDemo)
 	mux.HandleFunc("/", hello)
+	mux.HandleFunc("/debug/", sourceCodeHandler)
 	log.Fatal(http.ListenAndServe(":3000", recoverMw(mux, true)))
+}
+
+func sourceCodeHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.FormValue("path")
+	lineStr := r.FormValue("line")
+	line, err := strconv.Atoi(lineStr)
+	if err != nil {
+		line = -1
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	b := bytes.NewBuffer(nil)
+	_, err = io.Copy(b, file)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var lines [][2]int
+	if line > 0 {
+		lines = append(lines, [2]int{line, line})
+	}
+	lexer := lexers.Get("go")
+	iterator, err := lexer.Tokenise(nil, b.String())
+	style := styles.Get("github")
+	if style == nil {
+		style = styles.Fallback
+	}
+	formatter := html.New(html.TabWidth(2), html.WithLineNumbers(true), html.HighlightLines(lines))
+
+	w.Header().Set("Content-Type", "text/html")
+	formatter.Format(w, style, iterator)
 }
 
 func recoverMw(app http.Handler, dev bool) http.HandlerFunc {
@@ -29,7 +74,7 @@ func recoverMw(app http.Handler, dev bool) http.HandlerFunc {
 					return
 				}
 				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprintf(w, "<h1>panic: %v</h1><pre>%s</pre>", err, string(stack))
+				fmt.Fprintf(w, "<h1>panic: %v</h1><pre>%s</pre>", err, makeLinks(string(stack)))
 			}
 		}()
 
@@ -69,7 +114,8 @@ func (rw *responseWriter) Flush() {
 }
 
 func (rw *responseWriter) Write(b []byte) (int, error) {
-	rw.writes = append(rw.writes, b)
+	write := append([]byte(nil), b...)
+	rw.writes = append(rw.writes, write)
 	return len(b), nil
 }
 
@@ -105,4 +151,32 @@ func funcThatPanics() {
 
 func hello(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "<h1>Hello!</h1>")
+}
+
+func makeLinks(stack string) string {
+	lines := strings.Split(stack, "\n")
+	for li, line := range lines {
+		if len(line) == 0 || line[0] != '\t' {
+			continue
+		}
+		file := ""
+		for i, ch := range line {
+			if ch == ':' {
+				file = line[1:i]
+				break
+			}
+		}
+		var lineString strings.Builder
+		for i := len(file) + 2; i < len(line); i++ {
+			if line[i] < '0' || line[i] > '9' {
+				break
+			}
+			lineString.WriteByte(line[i])
+		}
+		v := url.Values{}
+		v.Set("path", file)
+		v.Set("line", lineString.String())
+		lines[li] = "\t<a href=\"/debug/?" + v.Encode() + "\">" + file + ":" + lineString.String() + "</a>" + line[len(file)+2+len(lineString.String()):]
+	}
+	return strings.Join(lines, "\n")
 }
